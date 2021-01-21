@@ -4,8 +4,22 @@ import numpy as np
 from . import kalman_filter
 from . import linear_assignment
 from . import iou_matching
-from .track import Track
+from .track import Track, TrackState
+from .detection import Detection
 
+
+def proposals2detections(proposals, features):
+    boxes = proposals.pred_boxes.tensor.cpu()
+    boxes[:,2] -= boxes[:,0]
+    boxes[:,3] -= boxes[:,1]
+    scores = proposals.scores.cpu()
+    features = features.cpu()
+    nums = len(proposals)
+    dets = []
+    for i in range(nums):
+        det = Detection(boxes[i], scores[i], features[i])
+        dets.append(det)
+    return dets
 
 class Tracker:
     """
@@ -37,7 +51,7 @@ class Tracker:
 
     """
 
-    def __init__(self, metric, max_iou_distance=0.7, max_age=30, n_init=3):
+    def __init__(self, metric, max_iou_distance=0.7, max_age=10, n_init=5):
         self.metric = metric
         self.max_iou_distance = max_iou_distance
         self.max_age = max_age
@@ -46,6 +60,13 @@ class Tracker:
         self.kf = kalman_filter.KalmanFilter()
         self.tracks = []
         self._next_id = 1
+        self.track_thre = 0.8
+        self.scen_cut = False
+
+    def reinit(self):
+        self.tracks = []
+        #for track in self.tracks:
+        #    track.state = TrackState.Tentative
 
     def predict(self):
         """Propagate track state distributions one time step forward.
@@ -55,7 +76,10 @@ class Tracker:
         for track in self.tracks:
             track.predict(self.kf)
 
-    def update(self, detections):
+    def get_boxes(self):
+        return [track.to_tlbr() for track in self.tracks]
+
+    def update(self, proposals, track_features):
         """Perform measurement update and track management.
 
         Parameters
@@ -65,6 +89,7 @@ class Tracker:
 
         """
         # Run matching cascade.
+        detections = proposals2detections(proposals, track_features)
         matches, unmatched_tracks, unmatched_detections = \
             self._match(detections)
 
@@ -72,10 +97,15 @@ class Tracker:
         for track_idx, detection_idx in matches:
             self.tracks[track_idx].update(
                 self.kf, detections[detection_idx])
+            proposals.pred_pids[detection_idx] = self.tracks[track_idx].track_id
+            print(detection_idx, track_idx)
         for track_idx in unmatched_tracks:
             self.tracks[track_idx].mark_missed()
         for detection_idx in unmatched_detections:
-            self._initiate_track(detections[detection_idx])
+            if (detections[detection_idx].confidence > self.track_thre 
+                    and proposals.pred_classes[detection_idx] in [0, 14, 15, 16]):
+                proposals.pred_pids[detection_idx] = self._next_id
+                self._initiate_track(detections[detection_idx])
         self.tracks = [t for t in self.tracks if not t.is_deleted()]
 
         # Update distance metric.
@@ -89,8 +119,24 @@ class Tracker:
             track.features = []
         self.metric.partial_fit(
             np.asarray(features), np.asarray(targets), active_targets)
+        return proposals
 
-    def _match(self, detections):
+    def pre_match(self, proposals, track_features):
+        # Run matching cascade.
+        detections = proposals2detections(proposals, track_features)
+        matches, unmatched_tracks, unmatched_detections = \
+            self._match(detections)
+
+        f = len(matches)
+        track_scores = np.zeros((len(detections), ))
+        for i, (track_idx, detection_idx) in enumerate(matches):
+            #proposals.scores[detection_idx] = 1
+            h = self.tracks[track_idx].hits
+            track_scores[detection_idx] = h/(h+10)
+            proposals.pred_pids[detection_idx] = self.tracks[track_idx].track_id
+        return proposals, track_scores
+
+    def _match(self, detections, pre_match=False):
 
         def gated_metric(tracks, dets, track_indices, detection_indices):
             features = np.array([dets[i].feature for i in detection_indices])
@@ -113,6 +159,8 @@ class Tracker:
             linear_assignment.matching_cascade(
                 gated_metric, self.metric.matching_threshold, self.max_age,
                 self.tracks, detections, confirmed_tracks)
+        if pre_match:
+            return matches_a, unmatched_tracks_a, unmatched_detections
 
         # Associate remaining tracks together with unconfirmed tracks using IOU.
         iou_track_candidates = unconfirmed_tracks + [
